@@ -64,3 +64,4 @@ target/
 # Eclipse
 .project
 .pydevproject
+.settings/
