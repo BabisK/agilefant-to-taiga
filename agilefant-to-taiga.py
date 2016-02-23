@@ -20,17 +20,118 @@ It defines classes_and_methods
 import sys
 import os
 
+import mysql.connector
+
+from taiga import TaigaAPI
+
 from argparse import ArgumentParser
 from argparse import RawDescriptionHelpFormatter
+from pydoc import describe
+from email.policy import default
+from taiga.models.models import Milestones
 
 __all__ = []
 __version__ = 0.1
 __date__ = '2016-02-22'
 __updated__ = '2016-02-22'
 
-DEBUG = 1
+DEBUG = 0
 TESTRUN = 0
 PROFILE = 0
+
+def migrate_products(conn, taiga, product=None):
+    cursor = conn.cursor()
+    
+    query = ('SELECT name, description '
+             'FROM backlogs '
+             'WHERE backlogtype="Product" ')
+    
+    if product:
+        query += 'AND name=%s'
+        cursor.execute(query, (product,))
+    else:
+        cursor.execute(query)
+    
+    projects = []
+    for (name, description) in cursor:
+        if description == '':
+            projects.append(taiga.projects.create(name, 'Describe this project'))
+        else:
+            projects.append(taiga.projects.create(name, description))
+            
+    for project in projects:
+        migrate_stories(conn, taiga, project)
+        migrate_iterations(conn, taiga, project)
+    
+    return projects
+
+def migrate_iterations(conn, taiga, project):
+    cursor = conn.cursor()
+    
+    query = ('SELECT prod.name, proj.name, iter.name, iter.startDate, iter.endDate '
+             'FROM backlogs prod '
+             'JOIN backlogs proj '
+             'ON prod.id = proj.parent_id '
+             'JOIN backlogs iter '
+             'ON proj.id = iter.parent_id '
+             'WHERE prod.name=%s')
+    
+    cursor.execute(query, (project.name,))
+            
+    milestones = []
+    for (prod_name, proj_name, iter_name, iter_startDate, iter_endDate) in cursor:
+        milestones.append(project.add_milestone(iter_name, iter_startDate, iter_endDate))
+    
+    for milestone in milestones:
+        migrate_stories(conn, taiga, project, milestone)
+
+def migrate_stories(conn, taiga, project, milestone=None):
+    cursor = conn.cursor()
+    
+    #points = project.list_points()
+    
+    if milestone != None:
+        query = ('SELECT name, description, storyPoints '
+                 'FROM stories '
+                 'WHERE iteration_id IN '
+                 '(SELECT iter.id '
+                 'FROM backlogs prod '
+                 'JOIN backlogs proj '
+                 'ON prod.id = proj.parent_id '
+                 'JOIN backlogs iter '
+                 'ON proj.id = iter.parent_id '
+                 'WHERE prod.name=%s AND iter.name=%s)')
+    
+        cursor.execute(query, (project.name, milestone.name))
+    
+        for (name, description, storyPoints) in cursor:
+            project.add_user_story(name, description=description if description else '', milestone=milestone.id)
+    else:
+        query = ('SELECT name, description, storyPoints '
+                 'FROM stories '
+                 'WHERE iteration_id is null '
+                 'AND (backlog_ID IN '
+                 '(SELECT prod.id '
+                 'FROM backlogs prod '
+                 'JOIN backlogs proj '
+                 'ON prod.id = proj.parent_id '
+                 'WHERE prod.name=%s) '
+                 'OR backlog_ID IN '
+                 '(SELECT proj.id '
+                 'FROM backlogs prod '
+                 'JOIN backlogs proj '
+                 'ON prod.id = proj.parent_id '
+                 'WHERE prod.name=%s)) '
+                 'AND id NOT IN '
+                 '(SELECT parent_id '
+                 'FROM stories '
+                 'WHERE parent_id IS NOT null)')
+        
+        cursor.execute(query, (project.name, project.name))
+        
+        for (name, description, storyPoints) in cursor:
+            #s = next((sp for sp in points if sp.name==str(storyPoints)), points[0])
+            project.add_user_story(name, description=description if description else '')
 
 class CLIError(Exception):
     '''Generic exception to raise and log different fatal errors.'''
@@ -42,7 +143,7 @@ class CLIError(Exception):
     def __unicode__(self):
         return self.msg
 
-def main(argv=None): # IGNORE:C0111
+def main(argv=None):  # IGNORE:C0111
     '''Command line options.'''
 
     if argv is None:
@@ -73,11 +174,24 @@ USAGE
         # Setup argument parser
         parser = ArgumentParser(description=program_license, formatter_class=RawDescriptionHelpFormatter)
         parser.add_argument('-V', '--version', action='version', version=program_version_message)
-        parser.add_argument('-d', '--database')
+        parser.add_argument('--agilefant-host', dest='agilefant_host', default='127.0.0.1', help='Host IP of the Agilefant database (default: 127.0.0.1')
+        parser.add_argument('--agilefant-user', dest='agilefant_user', default='agilefant', help='Agilefant database user (default: agilefant)')
+        parser.add_argument('--afilefant-password', dest='agilefant_password', default='agilefant', help='Agilefant database password for the defined user (default: agilefant)')
+        parser.add_argument('--agilefant-db', dest='agilefant_db', default='agilefant', help='Agilefant database name (default: agilefant)')
+        parser.add_argument('--taiga-host', dest='taiga_host', default='127.0.0.1', help='Host IP or FQDN of the Taiga API server (default: 127.0.0.1)')
 
         # Process arguments
         args = parser.parse_args()
-
+        
+        cnx = mysql.connector.connect(user=args.agilefant_user, password=args.agilefant_password, host=args.agilefant_host, database=args.agilefant_db)
+        
+        taiga = TaigaAPI(host='http://%s' % args.taiga_host)
+        taiga.auth(username='admin',password='123123')
+        
+        migrate_products(cnx, taiga=taiga)
+        
+        cnx.close()
+        
     except KeyboardInterrupt:
         ### handle keyboard interrupt ###
         return 0
@@ -92,8 +206,6 @@ USAGE
 if __name__ == "__main__":
     if DEBUG:
         sys.argv.append("-h")
-        sys.argv.append("-v")
-        sys.argv.append("-r")
     if TESTRUN:
         import doctest
         doctest.testmod()
